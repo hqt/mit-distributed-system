@@ -1,12 +1,13 @@
 package kvraft
 
 import (
-	"labgob"
-	"labrpc"
 	"log"
-	"raft"
 	"sync"
 	"sync/atomic"
+
+	"github.com/hqt/mit-distributed-system/src/labgob"
+	"github.com/hqt/mit-distributed-system/src/labrpc"
+	"github.com/hqt/mit-distributed-system/src/raft"
 )
 
 const Debug = 0

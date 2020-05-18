@@ -4,10 +4,13 @@ package main
 // see directions in pbc.go
 //
 
-import "time"
-import "viewservice"
-import "os"
-import "fmt"
+import (
+	"fmt"
+	"os"
+	"time"
+
+	"github.com/hqt/mit-distributed-system/src/viewservice"
+)
 
 func main() {
 	if len(os.Args) != 2 {

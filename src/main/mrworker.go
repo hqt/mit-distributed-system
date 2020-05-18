@@ -8,11 +8,14 @@ package main
 // go run mrworker.go ../mrapps/wc.so
 //
 
-import "mr"
-import "plugin"
-import "os"
-import "fmt"
-import "log"
+import (
+	"fmt"
+	"log"
+	"os"
+	"plugin"
+
+	"github.com/hqt/mit-distributed-system/src/mr"
+)
 
 func main() {
 	if len(os.Args) != 2 {

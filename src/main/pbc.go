@@ -1,5 +1,12 @@
 package main
 
+import (
+	"fmt"
+	"os"
+
+	"github.com/hqt/mit-distributed-system/src/pbservice"
+)
+
 //
 // pbservice client application
 //
@@ -17,10 +24,6 @@ package main
 // start the pbd programs in separate windows and kill
 // and restart them to exercise fault tolerance.
 //
-
-import "pbservice"
-import "os"
-import "fmt"
 
 func usage() {
 	fmt.Printf("Usage: pbc viewport key\n")
