@@ -8,17 +8,24 @@ package raft
 // test with the original before submitting.
 //
 
-import "testing"
-import "fmt"
-import "time"
-import "math/rand"
-import "sync/atomic"
-import "sync"
+import (
+	"log"
+	"math/rand"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+)
 
 // The tester generously allows solutions to complete elections in one second
 // (much more than the paper's range of timeouts).
 const RaftElectionTimeout = 1000 * time.Millisecond
 
+// check some strict conditions. rarely violates so it is nice to have those checks in test
+const StrictMode = true
+
+// simple test: check if we can vote a leader
+// and a leader doesn't change if nothing bad happens (network is good + not node leaves group)
 func TestInitialElection2A(t *testing.T) {
 	servers := 3
 	cfg := make_config(t, servers, false)
@@ -27,7 +34,7 @@ func TestInitialElection2A(t *testing.T) {
 	cfg.begin("Test (2A): initial election")
 
 	// is a leader elected?
-	cfg.checkOneLeader()
+	leader1 := cfg.checkOneLeader()
 
 	// sleep a bit to avoid racing with followers learning of the
 	// election, then check that all peers agree on the term.
@@ -36,20 +43,32 @@ func TestInitialElection2A(t *testing.T) {
 	if term1 < 1 {
 		t.Fatalf("term is %v, but should be at least 1", term1)
 	}
+	// more constraint: we only need 3 terms to finally found the leader
+	// - term 0: when everyone is follower
+	// - term 1: they become a candidate
+	// - term 2: when one node is timout earlier, then start new election round again then become leader
+	if term1 > 2 && StrictMode {
+		t.Fatalf("term is %v, but expect 2. The algorithm might be not effective", term1)
+	}
 
 	// does the leader+term stay the same if there is no network failure?
-	time.Sleep(2 * RaftElectionTimeout)
+	time.Sleep(RaftElectionTimeout)
 	term2 := cfg.checkTerms()
-	if term1 != term2 {
-		fmt.Printf("warning: term changed even though there were no failures")
+	if term1 != term2 && StrictMode {
+		// log.Printf("warning: term changed even though there were no failures. term1=%d term2=%d\n", term1, term2)
+		t.Fatalf("warning: term changed even though there were no failures. term1=%d term2=%d\n", term1, term2)
 	}
 
 	// there should still be a leader.
-	cfg.checkOneLeader()
+	leader2 := cfg.checkOneLeader()
+	if leader1 != leader2 && StrictMode {
+		t.Fatalf("should be same leader when everything normal. leader1:%d leader2:%d\n", leader1, leader2)
+	}
 
 	cfg.end()
 }
 
+// test if a node join / rejoin the group. and the network is stable
 func TestReElection2A(t *testing.T) {
 	servers := 3
 	cfg := make_config(t, servers, false)
@@ -60,28 +79,53 @@ func TestReElection2A(t *testing.T) {
 	leader1 := cfg.checkOneLeader()
 
 	// if the leader disconnects, a new one should be elected.
+	log.Println("start to disconnect leader", leader1)
 	cfg.disconnect(leader1)
-	cfg.checkOneLeader()
 
-	// if the old leader rejoins, that shouldn't
-	// disturb the new leader.
+	log.Println("check if system can vote a new leader after a node is down")
+	leader := cfg.checkOneLeader()
+	log.Printf("done. success!!!. Leader %d is up", leader)
+
+	// if the old leader rejoins, that shouldn't disturb the new leader.
+	log.Println("rejoin again old leader", leader1)
 	cfg.connect(leader1)
-	leader2 := cfg.checkOneLeader()
 
-	// if there's no quorum, no leader should
-	// be elected.
+	log.Println("check if system can vote a new leader after crashed node is rejoin")
+	leader2 := cfg.checkOneLeader()
+	log.Printf("done. success!!!. Leader %d is up", leader2)
+
+	// if there's no quorum, no leader should be elected.
+	log.Println("start to disconnect node", leader2)
 	cfg.disconnect(leader2)
+	log.Println("start to disconnect node=", (leader2+1)%servers)
 	cfg.disconnect((leader2 + 1) % servers)
-	time.Sleep(2 * RaftElectionTimeout)
+
+	log.Println("waiting sometimes and expect no leader can join")
+	// term here increases many times
+	// because the final node try to vote -> unsuccessful -> timeout -> vote again on new term ...
+	time.Sleep(RaftElectionTimeout)
 	cfg.checkNoLeader()
+	log.Println("success to check no leader found !!!!")
 
 	// if a quorum arises, it should elect a leader.
+	log.Println("add again node=", (leader2+1)%servers)
 	cfg.connect((leader2 + 1) % servers)
-	cfg.checkOneLeader()
+	leader3 := cfg.checkOneLeader()
+	log.Printf("done. success!!!. Leader %d is up", leader3)
 
 	// re-join of last node shouldn't prevent leader from existing.
+	log.Println("add again node=", leader2)
 	cfg.connect(leader2)
-	cfg.checkOneLeader()
+	leader4 := cfg.checkOneLeader()
+
+	if leader3 != leader4 && StrictMode {
+		t.Fatalf("warning: leader changed from %d to %d\n", leader3, leader4)
+	}
+
+	term := cfg.checkTerms()
+	if term > 20 && StrictMode {
+		t.Fatalf("warning: not expect term too high. Might the algorithm not effective")
+	}
 
 	cfg.end()
 }

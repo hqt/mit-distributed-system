@@ -18,13 +18,25 @@ package raft
 //
 
 import (
-	"github.com/hqt/mit-distributed-system/src/labrpc"
+	"fmt"
 	"sync"
-)
-import "sync/atomic"
+	"sync/atomic"
+	"time"
 
-// import "bytes"
-// import "labgob"
+	"github.com/hqt/mit-distributed-system/src/labrpc"
+)
+
+// all constants
+const (
+	// min and max timeout is optimized based on section 5.2 and 9.3
+	minElectionTimeoutMs = 150
+	maxElectionTimeoutMs = 300
+	// heartBeat timout <= min election timeout
+	// random timeout to avoid many followers become timeout and become candidates at the same time
+	minHeartBeatTimeoutMs    = 100
+	maxHeartBeatTimeoutMs    = 120
+	sendHeartBeatDuration = time.Duration(80) * time.Millisecond
+)
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -50,23 +62,35 @@ type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
-	me        int                 // this peer's index into peers[]
+	me        int64               // this peer's index into peers[]
 	dead      int32               // set by Kill()
 
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
+	raftState
 
+	// custom
+	lastHeard       map[int64]time.Time       // last heard from other peers
+	stopCh          chan bool                 // use to stop the concurrency job try to run between peer's raftState
+	finishCh        chan bool                 // use to wait result from the stopCh to make sure the concurrent job finish
+	requestVoteCh   chan RequestVoteRequest   // all rpc RequestVote requests will move here to process
+	appendEntriesCh chan AppendEntriesRequest // all rpc AppendEntries requests will move here to process
+}
+
+func (rf *Raft) getTotalPeers() int {
+	return len(rf.peers)
+}
+
+func (rf *Raft) quorum() int {
+	return len(rf.peers)/2 + 1
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
-	var term int
-	var isleader bool
 	// Your code here (2A).
-	return term, isleader
+	return int(rf.raftState.getCurrentTerm()), rf.raftState.getState() == Leader
 }
 
 //
@@ -107,27 +131,34 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
-//
-// example RequestVote RPC arguments structure.
-// field names must start with capital letters!
-//
-type RequestVoteArgs struct {
-	// Your data here (2A, 2B).
-}
-
-//
-// example RequestVote RPC reply structure.
-// field names must start with capital letters!
-//
-type RequestVoteReply struct {
-	// Your data here (2A).
-}
-
-//
-// example RequestVote RPC handler.
-//
+// RequestVote handler this method is triggered by the candidate by the RPC call `raft.RequestVote`
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+
+	replyCh := make(chan RequestVoteReply)
+	rf.requestVoteCh <- RequestVoteRequest{
+		args:    args,
+		replyCh: replyCh,
+	}
+	e := <-replyCh
+	// reply = &e // wrong: because behind reply object is the byte array which is tracked by the labrpc package
+	// manually copy fields
+	reply.Term = e.Term
+	reply.VotedGranted = e.VotedGranted
+}
+
+// AppendEntries handler this method is triggered by the leader in the RPC call `raft.AppendEntries` with:
+// - heartbeat: (section 5.2)
+// - replicate log entries: (section 5.3)
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	replyCh := make(chan AppendEntriesReply)
+	rf.appendEntriesCh <- AppendEntriesRequest{
+		args:    args,
+		replyCh: replyCh,
+	}
+	e := <-replyCh
+	reply.Success = e.Success
+	reply.Term = e.Term
 }
 
 //
@@ -161,6 +192,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	return ok
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
 
@@ -201,6 +237,14 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
+
+	rf.stopCh <- true
+	// wait for other coroutine finish
+	<-rf.finishCh
+
+	close(rf.stopCh)
+	//close(rf.requestVoteCh)
+	//close(rf.appendEntriesCh)
 }
 
 func (rf *Raft) killed() bool {
@@ -213,23 +257,240 @@ func (rf *Raft) killed() bool {
 // of all the Raft servers (including this one) are in peers[]. this
 // server's port is peers[me]. all the servers' peers[] arrays
 // have the same order. persister is a place for this server to
-// save its persistent state, and also initially holds the most
-// recent saved state, if any. applyCh is a channel on which the
+// save its persistent raftState, and also initially holds the most
+// recent saved raftState, if any. applyCh is a channel on which the
 // tester or service expects Raft to send ApplyMsg messages.
 // Make() must return quickly, so it should start goroutines
 // for any long-running work.
 //
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
-	rf := &Raft{}
-	rf.peers = peers
-	rf.persister = persister
-	rf.me = me
+	rf := &Raft{
+		peers:     peers,
+		persister: persister,
+		me:        int64(me),
 
-	// Your initialization code here (2A, 2B, 2C).
+		// Your initialization code here (2A, 2B, 2C).
+		raftState: newRaftState(),
+
+		stopCh:          make(chan bool, 0),
+		finishCh:        make(chan bool, 0),
+		requestVoteCh:   make(chan RequestVoteRequest, 100),
+		appendEntriesCh: make(chan AppendEntriesRequest, 100),
+		lastHeard:       map[int64]time.Time{},
+	}
+
+	go rf.run()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	return rf
+}
+
+// run switch between Raft's finite raftState machine Follower / Candidate / Leader
+func (rf *Raft) run() {
+	for {
+		select {
+		case <-rf.stopCh:
+			rf.finishCh <- true
+			return
+		default:
+		}
+
+		switch rf.raftState.getState() {
+		case Follower:
+			rf.runFollower()
+		case Candidate:
+			rf.runCandidate()
+		case Leader:
+			rf.runLeader()
+		}
+	}
+}
+
+func (rf *Raft) runFollower() {
+	PrintDebug(rf, fmt.Sprintf("enter follower loop. Leader=%d", rf.getVoteFor()))
+
+	heartBeatTimeoutMs := int64(randomInt(minHeartBeatTimeoutMs, maxHeartBeatTimeoutMs))
+	heartBeatTimeoutCh := time.After(time.Duration(heartBeatTimeoutMs) * time.Millisecond)
+	for rf.getState() == Follower {
+		select {
+		case e := <-rf.appendEntriesCh:
+			rf.rpcAppendEntries(e)
+		case e := <-rf.requestVoteCh:
+			rf.rpcRequestVote(e)
+		case <-heartBeatTimeoutCh:
+			heartBeatTimeoutCh = time.After(time.Duration(heartBeatTimeoutMs) * time.Millisecond)
+			if rf.votedFor == -1 {
+				rf.updateState(Candidate)
+				return
+			}
+			lastTime := rf.lastHeard[rf.votedFor]
+			delta := time.Now().Sub(lastTime).Milliseconds()
+			if delta > int64(heartBeatTimeoutMs) {
+				PrintDebug(rf, fmt.Sprintf("timeout %d ms for waiting leader %d", delta, rf.votedFor))
+				rf.updateState(Candidate)
+				rf.votedFor = -1
+				return
+			}
+		case <-rf.stopCh:
+			rf.finishCh <- true
+			return
+		default:
+		}
+	}
+}
+
+func (rf *Raft) runCandidate() {
+	PrintDebug(rf, fmt.Sprintf("enter candidate loop. Leader=%d", rf.getVoteFor()))
+
+	// random the elect timeout: section 5.2. avoid the elect phrase runs indefinitely
+	electionTimeoutCh := randomTimeout(minElectionTimeoutMs, maxElectionTimeoutMs)
+	resultCh := rf.electSelf()
+
+	totalVotes := 0
+	for rf.getState() == Candidate {
+		select {
+		case e := <-rf.requestVoteCh:
+			rf.rpcRequestVote(e)
+		case e := <-rf.appendEntriesCh:
+			rf.rpcAppendEntries(e)
+		case e := <-resultCh:
+			// handle the event
+			if !e.networkStatus {
+				PrintDebug(rf, fmt.Sprintf("network error when request vote to %d", e.receiverID))
+			} else {
+				if e.voteReply.Term > rf.getCurrentTerm() {
+					// "rule-for-server"
+					PrintDebug(rf,
+						fmt.Sprintf("[voteResult] down to follower because older term: my_term=%d - peer_term=%d",
+							rf.getCurrentTerm(), e.voteReply.Term))
+					rf.setTerm(e.voteReply.Term)
+					rf.updateState(Follower)
+					return
+				}
+				if e.voteReply.VotedGranted {
+					totalVotes++
+					PrintDebug(rf,
+						fmt.Sprintf("[voteResult] server=%d received vote from server=%d with term=%d. Total: %d",
+							rf.me, e.receiverID, e.voteReply.Term, totalVotes))
+				}
+			}
+
+			// check if elect phrase can be finished
+			if totalVotes >= rf.quorum() {
+				PrintDebug(rf, fmt.Sprintf("[voteResult] server=%d become leader at term %d", rf.me, rf.getCurrentTerm()))
+				rf.updateState(Leader)
+				return
+			}
+		case <-electionTimeoutCh:
+			// restart again the election process
+			PrintDebug(rf, fmt.Sprintf("[voteResult] server=%d election timeout", rf.me))
+			return
+		case <-rf.stopCh:
+			rf.finishCh <- true
+			return
+		}
+	}
+}
+
+type voteResult struct {
+	networkStatus bool
+	receiverID    int64
+	voteReply     *RequestVoteReply
+}
+
+// electSelf sends all requests to all peers
+func (rf *Raft) electSelf() <-chan voteResult {
+	result := make(chan voteResult, 100)
+
+	term := rf.increaseTerm()
+	// send itself a vote
+	rf.raftState.persistVoteFor(rf.me)
+	result <- voteResult{
+		networkStatus: true,
+		receiverID:    rf.me,
+		voteReply: &RequestVoteReply{
+			Term:         term,
+			VotedGranted: true,
+		},
+	}
+
+	for idx := range rf.peers {
+		if int64(idx) == rf.me {
+			continue
+		}
+
+		args := &RequestVoteArgs{
+			Term:        term,
+			CandidateID: rf.me,
+			LastLogIdx:  rf.getLastLogIndex(),
+			LastLogTerm: rf.getLastLogTerm(),
+		}
+
+		go func(serverID int) {
+			reply := &RequestVoteReply{}
+			ok := rf.sendRequestVote(serverID, args, reply)
+			result <- voteResult{
+				networkStatus: ok,
+				receiverID:    int64(serverID),
+				voteReply:     reply,
+			}
+		}(idx)
+	}
+
+	return result
+}
+
+func (rf *Raft) runLeader() {
+	PrintDebug(rf, fmt.Sprintf("enter leader loop. Leader=%d", rf.getVoteFor()))
+
+	replyCh := make(chan AppendEntriesReply, rf.getTotalPeers()*2)
+	timeOutCh := time.After(sendHeartBeatDuration)
+	rf.sendHeartBeat(replyCh)
+	for rf.getState() == Leader {
+		select {
+		case e := <-rf.requestVoteCh:
+			rf.rpcRequestVote(e)
+		case e := <-rf.appendEntriesCh:
+			rf.rpcAppendEntries(e)
+		case e := <-replyCh:
+			if e.Term > rf.getCurrentTerm() {
+				rf.updateState(Follower)
+				rf.persistVoteFor(-1)
+				return
+			}
+		case <-timeOutCh:
+			// resend heartbeat
+			timeOutCh = time.After(sendHeartBeatDuration)
+			rf.sendHeartBeat(replyCh)
+		case <-rf.stopCh:
+			rf.finishCh <- true
+			return
+		}
+	}
+}
+
+func (rf *Raft) sendHeartBeat(replyCh chan<- AppendEntriesReply) {
+	args := &AppendEntriesArgs{
+		Term:         rf.getCurrentTerm(),
+		LeaderID:     rf.me,
+		PrevLogIdx:   -1, // TODO later assignment
+		PrevLogTerm:  -1, // TODO later assignment
+		Entries:      nil,
+		LeaderCommit: 0,
+	}
+	for idx := range rf.peers {
+		if idx == int(rf.me) {
+			continue
+		}
+		go func(serverID int) {
+			reply := &AppendEntriesReply{}
+			ok := rf.sendAppendEntries(serverID, args, reply)
+			if ok {
+				replyCh <- *reply
+			}
+		}(idx)
+	}
 }

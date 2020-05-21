@@ -48,3 +48,9 @@ LABS=" lab1 lab2a lab2b lab2c lab3a lab3b lab4a lab4b "
 	else \
 		echo "Bad target $@. Usage: make [$(LABS)]"; \
 	fi
+
+test-2a:
+	go clean -testcache
+	cd src/raft && go test --race -run 2A
+.PHONY: test-2a
+
