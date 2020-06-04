@@ -33,12 +33,12 @@ type AppendEntriesRequest struct {
 // AppendEntriesArgs
 // field names must start with capital letters!
 type AppendEntriesArgs struct {
-	Term         int64         // leader term
-	LeaderID     int64         // so follower can know and redirect to client
-	PrevLogIdx   int64         // idx of log entry immediately preceding new one
-	PrevLogTerm  int64         // term of prevLogIdx
-	Entries      []interface{} // empty for heartbeat
-	LeaderCommit int64         // leader's commitIdx
+	Term         int64      // leader term
+	LeaderID     int64      // so follower can know and redirect to client
+	PrevLogIdx   int64      // idx of log entry immediately preceding new one
+	PrevLogTerm  int64      // term of prevLogIdx
+	Entries      []LogEntry // empty for heartbeat
+	LeaderCommit int64      // leader's commitIdx
 }
 
 // AppendEntriesReply
@@ -46,4 +46,18 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int64 // current term, for leader update itself
 	Success bool  // true if follower contained entry matching prevLogIndex and prevLogTerm
+}
+
+// CommandRequest contains request and response for Command RPC call
+type CommandRequest struct {
+	command  interface{}
+	logIndex int64
+	replyCh  chan<- CommandReply
+}
+
+// CommandReply reply from Command RPC call
+type CommandReply struct {
+	Success     bool
+	Index       int64
+	CurrentTerm int64
 }

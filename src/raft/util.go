@@ -24,3 +24,19 @@ func randomTimeout(minMs int, maxMs int) <-chan time.Time {
 	v := randomInt(minMs, maxMs)
 	return time.After(time.Duration(v) * time.Millisecond)
 }
+
+func minInt64(n1 int64, n2 int64) int64 {
+	if n1 < n2 {
+		return n1
+	}
+	return n2
+}
+
+// asyncNotify avoid beeing wait if the channel is full
+func asyncNotify(ch chan bool) {
+	select {
+	case ch <- true:
+	default:
+		return
+	}
+}
