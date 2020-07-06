@@ -236,7 +236,7 @@ func (cfg *config) cleanup() {
 
 // attach server i to the net.
 func (cfg *config) connect(i int) {
-	// fmt.Printf("connect(%d)\n", i)
+	fmt.Printf("connect(%d)\n", i)
 
 	cfg.connected[i] = true
 
@@ -259,7 +259,7 @@ func (cfg *config) connect(i int) {
 
 // detach server i from the net.
 func (cfg *config) disconnect(i int) {
-	// fmt.Printf("disconnect(%d)\n", i)
+	fmt.Printf("disconnect(%d)\n", i)
 
 	cfg.connected[i] = false
 
@@ -366,6 +366,7 @@ func (cfg *config) checkNoLeader() {
 func (cfg *config) nCommitted(index int) (int, interface{}) {
 	count := 0
 	var cmd interface{} = nil
+	var nodes []int
 	for i := 0; i < len(cfg.rafts); i++ {
 		if cfg.applyErr[i] != "" {
 			cfg.t.Fatal(cfg.applyErr[i])
@@ -381,9 +382,11 @@ func (cfg *config) nCommitted(index int) (int, interface{}) {
 					index, cmd, cmd1)
 			}
 			count += 1
+			nodes = append(nodes, i)
 			cmd = cmd1
 		}
 	}
+	// fmt.Printf("nodes: %v agreed on %d\n", nodes, index)
 	return count, cmd
 }
 
@@ -457,10 +460,11 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 			// somebody claimed to be the leader and to have
 			// submitted our command; wait a while for agreement.
 			t1 := time.Now()
-			for time.Since(t1).Seconds() < 2 {
+			for time.Since(t1).Seconds() < 5 {
 				nd, cmd1 := cfg.nCommitted(index)
 				if nd > 0 && nd >= expectedServers {
 					// committed
+					fmt.Printf("after total: %d. command: %v\n", nd, cmd1)
 					if cmd1 == cmd {
 						// and it was the command we submitted.
 						return index

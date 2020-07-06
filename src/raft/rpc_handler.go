@@ -38,15 +38,14 @@ func (rf *Raft) rpcRequestVote(req RequestVoteRequest) {
 
 	// condition 2 at the figure 2
 	if rf.getVoteFor() == -1 || rf.getVoteFor() == args.CandidateID {
-		if rf.moreUpToDate(args) {
-			PrintDebug(rf, fmt.Sprintf("[rpcRequestVote] accepted vote for server=%d with term=%d", args.CandidateID, args.Term))
-			reply.VotedGranted = true
-			rf.persistVoteFor(args.CandidateID)
-			return
-		} else {
-			PrintDebug(rf, fmt.Sprintf("[rpcRequestVote] denied vote: violate election restriction rule"))
+		if !rf.moreUpToDate(args) {
 			return
 		}
+
+		PrintDebug(rf, fmt.Sprintf("[rpcRequestVote] accepted vote for server=%d with term=%d", args.CandidateID, args.Term))
+		reply.VotedGranted = true
+		rf.persistVoteFor(args.CandidateID)
+		return
 	} else {
 		PrintDebug(rf, fmt.Sprintf("[rpcRequestVote] [server=%d] denied vote: candidate=%d != vote_for=%d",
 			rf.me, args.CandidateID, rf.getVoteFor()))
@@ -62,9 +61,12 @@ func (rf *Raft) moreUpToDate(candidate *RequestVoteArgs) bool {
 	logIdx := rf.logManager.getLastLogIndex()
 	logTerm := rf.logManager.getLastLogTerm()
 
-	if (candidate.Term > logTerm) || (logTerm == candidate.Term && candidate.LastLogIdx >= logIdx) {
+	if (candidate.LastLogTerm > logTerm) || (candidate.LastLogTerm == logTerm && candidate.LastLogIdx >= logIdx) {
 		return true
 	}
+	PrintDebug(rf,
+		fmt.Sprintf("[rpcRequestVote] denied vote from candidate %d: violate election restriction rule. candidate(log_term=%d, log_idx=%d) self(log_term=%d, log_idx=%d",
+			candidate.CandidateID, candidate.LastLogTerm, candidate.LastLogIdx, logTerm, logIdx))
 	return false
 }
 
@@ -83,6 +85,9 @@ func (rf *Raft) rpcAppendEntries(req AppendEntriesRequest) {
 
 	// figure 2: condition 1
 	if args.Term < rf.getCurrentTerm() {
+		PrintDebug(rf,
+			fmt.Sprintf("[rpcAppendEntries] reject request from server %d because term oudated. arg-term=%d current-term=%d\n",
+				args.LeaderID, args.Term, rf.getCurrentTerm()))
 		return
 	}
 
@@ -118,15 +123,21 @@ func (rf *Raft) rpcAppendEntries(req AppendEntriesRequest) {
 	//  - follower refuses the new entry if found no entry that match index and log
 	// len == 0 when heartbeat protocol
 	if len(args.Entries) > 0 {
-		log, ok := rf.logManager.getLogAtIndex(args.PrevLogIdx)
-		if !ok {
-			PrintDebug(rf, fmt.Sprintf("[rpcAppendEntries] violate condition 2. argIdx=%d, log_length=%d",
-				args.PrevLogIdx, rf.logManager.length()))
+		lastLogIdx := rf.logManager.getLastLogIndex()
+		if lastLogIdx < args.PrevLogIdx {
+			PrintDebug(rf, fmt.Sprintf("[rpcAppendEntries] violate condition 2. log is not fully replicated. self's lastLogIdx=%d leader's lastLogIdx=%d",
+				lastLogIdx, args.PrevLogIdx))
+			return
+		}
+
+		log := rf.logManager.getLogAtIndex(args.PrevLogIdx)
+		if log == nil {
+			PrintDebug(rf, fmt.Sprintf("[rpcAppendEntries] violate condition 2. error to retry log"))
 			return
 		}
 		// log.Term == -1 --> null --> this index has not replicated to this node. no problem
 		if log.Term != -1 && log.Term != args.PrevLogTerm {
-			PrintDebug(rf, fmt.Sprintf("[rpcAppendEntries] violate condition 2. [leader](LogIdx=%d, term=%d) [peer](LogIdx=%d, term=%d)",
+			PrintDebug(rf, fmt.Sprintf("[rpcAppendEntries] violate condition 2. [leader](PrevLogIdx=%d, PrevLogTerm=%d) [peer](LogIdx=%d, term=%d)",
 				args.PrevLogIdx, args.PrevLogTerm, log.Index, log.Term))
 			return
 		}
@@ -136,14 +147,34 @@ func (rf *Raft) rpcAppendEntries(req AppendEntriesRequest) {
 	// This condition maintains log consistency between leader and follower (5.3 - part 2)
 	// If an existing entry conflicts with a new one (same index but different terms)
 	// delete the existing entry and all that follow it
-	// TODO
+	var newEntries []LogEntry
+	lastLogIdx := rf.logManager.getLastLogIndex()
+	for idx, entry := range args.Entries {
+		// avoid out-of-bound exception when getting a log entry not exist in the system
+		if entry.Index > lastLogIdx {
+			newEntries = args.Entries[idx:]
+			break
+		}
+
+		log := rf.logManager.getLogAtIndex(entry.Index)
+		if log.Term != entry.Term {
+			PrintDebug(rf, fmt.Sprintf("[rpcAppendEntries] delete all logs from %d to %d", entry.Index, lastLogIdx))
+			rf.logManager.deleteLogsFrom(entry.Index)
+			newEntries = args.Entries[idx:]
+			break
+		}
+	}
 
 	// figure 2: condition 4
 	// Append any new entries not already in the log
-	for _, entry := range args.Entries {
-		rf.logManager.addLog(&entry)
-		PrintDebug(rf, fmt.Sprintf("[rpcAppendEntries] replicated log with index=%d term=%d. log-length:%d",
-			entry.Index, entry.Term, rf.logManager.length()))
+	if len(newEntries) > 0 {
+		PrintDebug(rf, fmt.Sprintf("[rpcAppendEntries] appending new logs from %d to %d",
+			newEntries[0].Index, newEntries[len(newEntries)-1].Index))
+		for _, entry := range newEntries {
+			rf.logManager.addLog(entry)
+			PrintDebug(rf, fmt.Sprintf("[rpcAppendEntries] --> replicated log with index=%d term=%d. value=%v log-length:%d",
+				entry.Index, entry.Term, entry.Data, rf.logManager.length()))
+		}
 	}
 
 	// figure 2: condition 5
@@ -151,18 +182,19 @@ func (rf *Raft) rpcAppendEntries(req AppendEntriesRequest) {
 	lastCommitIdx := rf.getCommitIndex()
 	if args.LeaderCommit > lastCommitIdx {
 		min := minInt64(args.LeaderCommit, rf.logManager.getLastLogIndex())
-		rf.setCommitIndex(min)
+		// rf.setCommitIndex(min)
 
 		// notify new commits to FSM. necessary for testing
 		for i := lastCommitIdx + 1; i <= min; i++ {
-			log, _ := rf.logManager.getLogAtIndex(i)
-			PrintDebug(rf, fmt.Sprintf("[rpcAppendEntries] accepted commit from leader. leader_id=%d index=%d term=%d",
-				args.LeaderID, i, args.Term))
+			log := rf.logManager.getLogAtIndex(i)
 			rf.applyCh <- ApplyMsg{
 				CommandValid: true,
 				Command:      log.Data,
 				CommandIndex: int(log.Index),
 			}
+			rf.setCommitIndex(i)
+			PrintDebug(rf, fmt.Sprintf("[rpcAppendEntries] node=%d accepted commit from leader. leader_id=%d index=%d term=%d",
+				rf.me, args.LeaderID, i, args.Term))
 		}
 	}
 

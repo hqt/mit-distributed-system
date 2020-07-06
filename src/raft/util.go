@@ -32,6 +32,13 @@ func minInt64(n1 int64, n2 int64) int64 {
 	return n2
 }
 
+func maxInt64(n1 int64, n2 int64) int64 {
+	if n1 < n2 {
+		return n2
+	}
+	return n1
+}
+
 // asyncNotify avoid beeing wait if the channel is full
 func asyncNotify(ch chan bool) {
 	select {

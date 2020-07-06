@@ -1,6 +1,9 @@
 package raft
 
-import "sync"
+import (
+	"fmt"
+	"sync"
+)
 
 // leaderState data for the peer in the leader state
 type leaderState struct {
@@ -57,7 +60,9 @@ func (s *leaderState) startReplicationJobs() {
 // stopReplicationJobs stop all replication jobs. Sync call
 func (s *leaderState) stopReplicationJobs() {
 	for serverID := range s.replicationJobs {
+		fmt.Println("try to stop replication job from ", serverID)
 		s.replicationJobs[serverID].stop()
+		fmt.Println("replication stop done ", serverID)
 	}
 }
 
@@ -83,7 +88,8 @@ func (s *leaderState) updateIdx(serverID int64, nextIdx int64, matchIdx int64) {
 func (s *leaderState) decreaseNextIdx(serverID int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.nextIdx[serverID]--
+	nextID := maxInt64(s.nextIdx[serverID]-1, 1)
+	s.nextIdx[serverID] = nextID
 }
 
 // getLatestReplicateIdx returns latest replicate id on each follower node.
