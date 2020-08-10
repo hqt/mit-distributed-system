@@ -19,9 +19,11 @@ package raft
 
 import (
 	"fmt"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/hqt/mit-distributed-system/src/labrpc"
 )
@@ -33,9 +35,10 @@ const (
 	maxElectionTimeoutMs = 300
 	// heartBeat timout <= min election timeout
 	// random timeout to avoid many followers become timeout and become candidates at the same time
-	minHeartBeatTimeoutMs    = 100
-	maxHeartBeatTimeoutMs    = 120
-	sendHeartBeatDuration = time.Duration(80) * time.Millisecond
+	minHeartBeatTimeoutMs  = 100
+	maxHeartBeatTimeoutMs  = 120
+	sendHeartBeatDuration  = time.Duration(80) * time.Millisecond
+	commandTimeoutDuration = time.Duration(100) * time.Millisecond
 )
 
 //
@@ -68,14 +71,21 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
+
+	// standard raft state
 	raftState
 
-	// custom
+	// state only for leader
+	*leaderState
+
 	lastHeard       map[int64]time.Time       // last heard from other peers
-	stopCh          chan bool                 // use to stop the concurrency job try to run between peer's raftState
-	finishCh        chan bool                 // use to wait result from the stopCh to make sure the concurrent job finish
 	requestVoteCh   chan RequestVoteRequest   // all rpc RequestVote requests will move here to process
 	appendEntriesCh chan AppendEntriesRequest // all rpc AppendEntries requests will move here to process
+	commandCh       chan CommandRequest       // all rpc Start requests to send command will move here to process later
+
+	applyCh  chan ApplyMsg // notify to the upstream (e.g.: FSM) a log entry has been committed. pass from constructor from the up-stream object. Need for testing
+	stopCh   chan bool     // use to stop the concurrency job try to run between peer's raftState
+	finishCh chan bool     // use to wait result from the stopCh to make sure the concurrent job finish
 }
 
 func (rf *Raft) getTotalPeers() int {
@@ -84,6 +94,10 @@ func (rf *Raft) getTotalPeers() int {
 
 func (rf *Raft) quorum() int {
 	return len(rf.peers)/2 + 1
+}
+
+func (rf *Raft) nodeID() int64 {
+	return atomic.LoadInt64(&rf.me)
 }
 
 // return currentTerm and whether this server
@@ -214,14 +228,71 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // term. the third return value is true if this server believes it is
 // the leader.
 //
-func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
-
+func (rf *Raft) Start1(command interface{}) (int, int, bool) {
 	// Your code here (2B).
 
-	return index, term, isLeader
+	if rf.getState() != Leader {
+		return -1, int(rf.getCurrentTerm()), false
+	}
+
+	nextLogIdx := rf.logManager.getLastLogIndex() + 1
+	replyCh := make(chan CommandReply)
+
+	commandLog := ""
+	if unsafe.Sizeof(command) < 24 {
+		commandLog = fmt.Sprintf("command with value=%v", command)
+	} else {
+		commandLog = fmt.Sprintf("command with length=%d", unsafe.Sizeof(command))
+	}
+
+	PrintDebug(rf, fmt.Sprintf("[Start] sending %s to channel", commandLog))
+	rf.commandCh <- CommandRequest{
+		command: command,
+		replyCh: replyCh,
+	}
+	PrintDebug(rf, fmt.Sprintf("[Start] sent %s to channel. waiting for committed", commandLog))
+
+	for {
+		select {
+		case <-time.After(commandTimeoutDuration):
+			return int(nextLogIdx), int(rf.getCurrentTerm()), false
+		case e := <-replyCh:
+			PrintDebug(rf, "[Start] done. returned to client")
+			return int(e.Index), int(e.CurrentTerm), true
+		}
+	}
+}
+
+// the first return value is the index that the command will appear at
+// if it's ever committed. the second return value is the current
+// term. the third return value is true if this server believes it is
+// the leader.
+//
+func (rf *Raft) Start(command interface{}) (int, int, bool) {
+	// Your code here (2B).
+
+	if rf.getState() != Leader {
+		return -1, int(rf.getCurrentTerm()), false
+	}
+
+	replyCh := make(chan CommandReply)
+
+	commandLog := ""
+	if unsafe.Sizeof(command) < 24 {
+		commandLog = fmt.Sprintf("command with value=%v", command)
+	} else {
+		commandLog = fmt.Sprintf("command with length=%d", unsafe.Sizeof(command))
+	}
+
+	PrintDebug(rf, fmt.Sprintf("[Start] sending %s to channel", commandLog))
+	rf.commandCh <- CommandRequest{
+		command: command,
+		replyCh: replyCh,
+	}
+	PrintDebug(rf, fmt.Sprintf("[Start] sent %s to channel. waiting for committed", commandLog))
+
+	e := <-replyCh
+	return int(e.Index), int(rf.getCurrentTerm()), true
 }
 
 //
@@ -273,11 +344,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		// Your initialization code here (2A, 2B, 2C).
 		raftState: newRaftState(),
 
-		stopCh:          make(chan bool, 0),
-		finishCh:        make(chan bool, 0),
+		stopCh:   make(chan bool, 0),
+		finishCh: make(chan bool, 0),
+
 		requestVoteCh:   make(chan RequestVoteRequest, 100),
 		appendEntriesCh: make(chan AppendEntriesRequest, 100),
 		lastHeard:       map[int64]time.Time{},
+
+		applyCh:   applyCh,
+		commandCh: make(chan CommandRequest, 0),
 	}
 
 	go rf.run()
@@ -316,6 +391,8 @@ func (rf *Raft) runFollower() {
 	heartBeatTimeoutCh := time.After(time.Duration(heartBeatTimeoutMs) * time.Millisecond)
 	for rf.getState() == Follower {
 		select {
+		case <-rf.commandCh:
+			// do nothing
 		case e := <-rf.appendEntriesCh:
 			rf.rpcAppendEntries(e)
 		case e := <-rf.requestVoteCh:
@@ -328,7 +405,7 @@ func (rf *Raft) runFollower() {
 			}
 			lastTime := rf.lastHeard[rf.votedFor]
 			delta := time.Now().Sub(lastTime).Milliseconds()
-			if delta > int64(heartBeatTimeoutMs) {
+			if delta > heartBeatTimeoutMs {
 				PrintDebug(rf, fmt.Sprintf("timeout %d ms for waiting leader %d", delta, rf.votedFor))
 				rf.updateState(Candidate)
 				rf.votedFor = -1
@@ -352,6 +429,8 @@ func (rf *Raft) runCandidate() {
 	totalVotes := 0
 	for rf.getState() == Candidate {
 		select {
+		case <-rf.commandCh:
+			// do nothing
 		case e := <-rf.requestVoteCh:
 			rf.rpcRequestVote(e)
 		case e := <-rf.appendEntriesCh:
@@ -359,7 +438,7 @@ func (rf *Raft) runCandidate() {
 		case e := <-resultCh:
 			// handle the event
 			if !e.networkStatus {
-				PrintDebug(rf, fmt.Sprintf("network error when request vote to %d", e.receiverID))
+				PrintDebug(rf, fmt.Sprintf("network error when send request vote to %d", e.receiverID))
 			} else {
 				if e.voteReply.Term > rf.getCurrentTerm() {
 					// "rule-for-server"
@@ -425,8 +504,8 @@ func (rf *Raft) electSelf() <-chan voteResult {
 		args := &RequestVoteArgs{
 			Term:        term,
 			CandidateID: rf.me,
-			LastLogIdx:  rf.getLastLogIndex(),
-			LastLogTerm: rf.getLastLogTerm(),
+			LastLogIdx:  rf.logManager.getLastLogIndex(),
+			LastLogTerm: rf.logManager.getLastLogTerm(),
 		}
 
 		go func(serverID int) {
@@ -446,25 +525,86 @@ func (rf *Raft) electSelf() <-chan voteResult {
 func (rf *Raft) runLeader() {
 	PrintDebug(rf, fmt.Sprintf("enter leader loop. Leader=%d", rf.getVoteFor()))
 
-	replyCh := make(chan AppendEntriesReply, rf.getTotalPeers()*2)
+	rf.leaderState = newLeaderState(rf)
+	rf.leaderState.startReplicationJobs()
+
+	defer func() {
+		PrintDebug(rf, "stop replication jobs ...")
+		rf.leaderState.stopReplicationJobs()
+		rf.leaderState = nil
+	}()
+
+	heartBeatReplyCh := make(chan AppendEntriesReply, rf.getTotalPeers()*2)
 	timeOutCh := time.After(sendHeartBeatDuration)
-	rf.sendHeartBeat(replyCh)
+	rf.sendHeartBeat(heartBeatReplyCh)
 	for rf.getState() == Leader {
 		select {
 		case e := <-rf.requestVoteCh:
 			rf.rpcRequestVote(e)
 		case e := <-rf.appendEntriesCh:
 			rf.rpcAppendEntries(e)
-		case e := <-replyCh:
+		case e := <-rf.commandCh:
+			e.logIndex = rf.logManager.getLastLogIndex() + 1
+			PrintDebug(rf,
+				fmt.Sprintf("process command. last-log-id:%d. expected log-idx: %d",
+					rf.logManager.getLastLogIndex(), e.logIndex))
+			rf.logManager.addLog(LogEntry{
+				Term:  rf.getCurrentTerm(),
+				Index: e.logIndex,
+				Data:  e.command,
+			})
+			rf.processingCommand = &e
+			e.replyCh <- CommandReply{
+				Success:     true,
+				Index:       e.logIndex,
+				CurrentTerm: rf.getCurrentTerm(),
+			}
+			for _, job := range rf.leaderState.replicationJobs {
+				asyncNotify(job.signalCh)
+			}
+			// wait until replication job finish. then rf.commitCh will be triggered from replication jobs
+		case <-rf.commitCh:
+			nextIdx, ok := rf.checkPossibleCommitIdx()
+			if !ok {
+				continue
+			}
+
+			// user's command has been replicated on quorum of nodes
+			//if nextIdx >= rf.processingCommand.logIndex {
+			//	rf.processingCommand.replyCh <- CommandReply{
+			//		Success:     true,
+			//		Index:       rf.processingCommand.logIndex,
+			//		CurrentTerm: rf.getCurrentTerm(),
+			//	}
+			//	rf.processingCommand = nil
+			//}
+
+			committedIdx := rf.getCommitIndex()
+			// expect only 1 element. but for-loop to make sure
+			for i := committedIdx + 1; i <= nextIdx; i++ {
+				log := rf.logManager.getLogAtIndex(i)
+				rf.setCommitIndex(i)
+				rf.applyCh <- ApplyMsg{
+					CommandValid: true,
+					Command:      log.Data,
+					CommandIndex: int(log.Index),
+				}
+				PrintDebug(rf, fmt.Sprintf("committed index=%d term=%d", i, log.Term))
+			}
+		case e := <-heartBeatReplyCh:
 			if e.Term > rf.getCurrentTerm() {
 				rf.updateState(Follower)
 				rf.persistVoteFor(-1)
 				return
 			}
+		case <-rf.stepDownCh:
+			rf.updateState(Follower)
+			rf.persistVoteFor(-1)
+			return
 		case <-timeOutCh:
 			// resend heartbeat
 			timeOutCh = time.After(sendHeartBeatDuration)
-			rf.sendHeartBeat(replyCh)
+			rf.sendHeartBeat(heartBeatReplyCh)
 		case <-rf.stopCh:
 			rf.finishCh <- true
 			return
@@ -476,10 +616,10 @@ func (rf *Raft) sendHeartBeat(replyCh chan<- AppendEntriesReply) {
 	args := &AppendEntriesArgs{
 		Term:         rf.getCurrentTerm(),
 		LeaderID:     rf.me,
-		PrevLogIdx:   -1, // TODO later assignment
-		PrevLogTerm:  -1, // TODO later assignment
-		Entries:      nil,
-		LeaderCommit: 0,
+		PrevLogIdx:   rf.logManager.getLastLogIndex(),
+		PrevLogTerm:  rf.logManager.getLastLogTerm(),
+		Entries:      []LogEntry{},
+		LeaderCommit: rf.getCommitIndex(),
 	}
 	for idx := range rf.peers {
 		if idx == int(rf.me) {
@@ -493,4 +633,20 @@ func (rf *Raft) sendHeartBeat(replyCh chan<- AppendEntriesReply) {
 			}
 		}(idx)
 	}
+}
+
+// checkPossibleCommitIdx when replicate logs to followers, at some points of time, we have enough quorum
+func (rf *Raft) checkPossibleCommitIdx() (int64, bool) {
+	arr := rf.leaderState.getLatestReplicateIdx()
+	arr = append(arr, rf.logManager.getLastLogIndex())
+	if len(arr) != len(rf.peers) {
+		panic("invalid state")
+	}
+
+	sort.Slice(arr, func(i, j int) bool { return arr[i] > arr[j] })
+	largestCommittedIdx := arr[rf.quorum()-1]
+	if largestCommittedIdx > rf.getCommitIndex() {
+		return largestCommittedIdx, true
+	}
+	return 0, false
 }

@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"sync"
 	"sync/atomic"
 )
 
@@ -27,15 +28,18 @@ func (p PeerState) String() string {
 
 // raftState internal raftState of raft
 type raftState struct {
-	state PeerState
+	mu sync.RWMutex // Lock to protect shared resources that don't have atomic api
+	state       PeerState
 
-	// persistent state
+	// figure 2: persistent state
 	currentTerm int64 // latest term server has seen
 	votedFor    int64 // candidateID that received vote in the current term
 
-	// volatile state
-	commitIdx   int64 // idx of highest log entry known to be committed
+	// figure 2: volatile state
+	commitIdx   int64 // idx of highest log entry known to be committed --> check newer possible commit index
 	lastApplied int64 // idx of highest log entry applied to state machine
+
+	logManager *LogManager
 }
 
 // newRaftState creates a raftState object
@@ -44,6 +48,7 @@ func newRaftState() raftState {
 		state:       Follower,
 		currentTerm: 0,
 		votedFor:    -1,
+		logManager:  newLogManager(),
 	}
 }
 
@@ -67,7 +72,6 @@ func (s *raftState) setTerm(term int64) {
 	atomic.StoreInt64(&s.currentTerm, term)
 }
 
-// TODO we don't need to persist voteForID in the lab2A
 func (s *raftState) persistVoteFor(serverID int64) {
 	atomic.StoreInt64(&s.votedFor, serverID)
 }
@@ -76,13 +80,9 @@ func (s *raftState) getVoteFor() int64 {
 	return atomic.LoadInt64(&s.votedFor)
 }
 
-// TODO lab 2A doesn't require log
-func (s *raftState) getLastLogIndex() int64 {
-	return -1
+func (s *raftState) getCommitIndex() int64 {
+	return atomic.LoadInt64(&s.commitIdx)
 }
-
-// TODO lab 2A doesn't require log
-func (s *raftState) getLastLogTerm() int64 {
-	return -1
+func (s *raftState) setCommitIndex(idx int64) {
+	atomic.StoreInt64(&s.commitIdx, idx)
 }
-

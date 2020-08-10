@@ -54,3 +54,8 @@ test-2a:
 	cd src/raft && go test --race -run 2A
 .PHONY: test-2a
 
+test-2b: test-2a
+	go clean -testcache
+	cd src/raft && go test --race -run 2B
+.PHONY: test-2b
+
